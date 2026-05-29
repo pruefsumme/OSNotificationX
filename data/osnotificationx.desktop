@@ -1,0 +1,10 @@
+[Xfce Panel]
+Type=X-XFCE-PanelPlugin
+Encoding=UTF-8
+Name=OSNotificationX
+Comment=Old OS X style notification center for the Xfce panel
+Icon=osnotificationx
+X-XFCE-Module=osnotificationx
+X-XFCE-Internal=false
+X-XFCE-Unique=false
+X-XFCE-API=2.0
