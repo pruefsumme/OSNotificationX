@@ -8,6 +8,7 @@ xfconf_dep = dependency('libxfconf-0')
 sqlite_dep = dependency('sqlite3')
 
 osnx_common_sources = [
+  'osnx-hidden-store.c',
   'osnx-log-entry.c',
   'osnx-log-client.c',
   'osnx-notify-settings.c',

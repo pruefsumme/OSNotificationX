@@ -1,4 +1,5 @@
 #include "osnx-log-client.h"
+#include "osnx-hidden-store.h"
 
 #include <gio/gdesktopappinfo.h>
 #include <sqlite3.h>
@@ -19,7 +20,7 @@ struct _OsnxLogClient
   gboolean has_unread;
   gboolean available;
   gboolean using_sqlite_fallback;
-  GHashTable *hidden_ids;
+  OsnxHiddenStore *hidden_store;
 };
 
 static void osnx_log_client_emit_changed (OsnxLogClient *client);
@@ -47,10 +48,8 @@ static gboolean
 osnx_log_client_entry_is_hidden (OsnxLogClient       *client,
                                  const OsnxLogEntry *entry)
 {
-  return client->hidden_ids != NULL &&
-         entry != NULL &&
-         entry->id != NULL &&
-         g_hash_table_contains (client->hidden_ids, entry->id);
+  return entry != NULL &&
+         osnx_hidden_store_contains (client->hidden_store, entry->id);
 }
 
 static void
@@ -227,7 +226,7 @@ osnx_log_client_new (void)
   client->ref_count = 1;
   client->entries = g_ptr_array_new_with_free_func ((GDestroyNotify) osnx_log_entry_free);
   client->cancellable = g_cancellable_new ();
-  client->hidden_ids = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+  client->hidden_store = osnx_hidden_store_new (NULL);
 
   return client;
 }
@@ -255,7 +254,7 @@ osnx_log_client_unref (OsnxLogClient *client)
   g_clear_object (&client->cancellable);
   g_clear_object (&client->proxy);
   g_clear_pointer (&client->entries, g_ptr_array_unref);
-  g_clear_pointer (&client->hidden_ids, g_hash_table_unref);
+  g_clear_pointer (&client->hidden_store, osnx_hidden_store_free);
   g_free (client);
 }
 
@@ -504,10 +503,11 @@ osnx_log_client_mark_visible_read (OsnxLogClient *client)
 }
 
 void
-osnx_log_client_delete_group (OsnxLogClient *client,
-                              const gchar   *group_key)
+osnx_log_client_hide_group (OsnxLogClient *client,
+                            const gchar   *group_key)
 {
   guint i;
+  gboolean changed = FALSE;
 
   if (client == NULL || client->entries == NULL || group_key == NULL)
       return;
@@ -518,8 +518,11 @@ osnx_log_client_delete_group (OsnxLogClient *client,
       g_autofree gchar *entry_key = osnx_log_entry_app_key (entry);
 
       if (entry->id != NULL && g_strcmp0 (entry_key, group_key) == 0)
-        g_hash_table_add (client->hidden_ids, g_strdup (entry->id));
+        changed |= osnx_hidden_store_add (client->hidden_store, entry->id);
     }
+
+  if (changed)
+    osnx_hidden_store_save (client->hidden_store);
 
   osnx_log_client_refresh (client);
 }

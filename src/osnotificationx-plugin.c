@@ -147,7 +147,7 @@ osnx_drawer_clear_group (const gchar *group_key,
 {
   OsnxPlugin *self = user_data;
 
-  osnx_log_client_delete_group (self->log_client, group_key);
+  osnx_log_client_hide_group (self->log_client, group_key);
 }
 
 static void

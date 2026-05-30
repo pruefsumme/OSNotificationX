@@ -1,9 +1,9 @@
 #include "osnx-drawer.h"
 
 #define OSNX_DRAWER_WIDTH 336
-#define OSNX_SHADOW_WIDTH 18
-#define OSNX_WINDOW_WIDTH (OSNX_DRAWER_WIDTH + OSNX_SHADOW_WIDTH)
+#define OSNX_SHADOW_WIDTH 10
 #define OSNX_ANIMATION_MS 260
+#define OSNX_CLEAR_ANIMATION_MS 240
 
 typedef struct
 {
@@ -35,12 +35,25 @@ struct _OsnxDrawer
   gint current_x;
   gint end_x;
   gint64 animation_start_us;
+  guint clear_animation_count;
   gboolean visible;
   gboolean hiding;
   gboolean syncing_alerts_switch;
 };
 
 static void osnx_drawer_render (OsnxDrawer *drawer, GPtrArray *entries, gboolean log_available);
+static gdouble osnx_ease_out_cubic (gdouble t);
+
+typedef struct
+{
+  OsnxDrawer *drawer;
+  gchar *group_key;
+  GtkWidget *stage;
+  GtkWidget *drawing_area;
+  cairo_surface_t *surface;
+  gint64 animation_start_us;
+  gdouble progress;
+} OsnxClearAnimation;
 
 static void
 osnx_group_free (OsnxGroup *group)
@@ -96,6 +109,89 @@ osnx_container_clear (GtkWidget *container)
 }
 
 static void
+osnx_clear_animation_free (OsnxClearAnimation *animation)
+{
+  if (animation == NULL)
+    return;
+
+  if (animation->surface != NULL)
+    cairo_surface_destroy (animation->surface);
+  g_free (animation->group_key);
+  g_free (animation);
+}
+
+static gboolean
+osnx_clear_snapshot_draw (GtkWidget *widget G_GNUC_UNUSED,
+                          cairo_t   *cr,
+                          gpointer   user_data)
+{
+  OsnxClearAnimation *animation = user_data;
+  gint x;
+
+  if (animation->surface == NULL)
+    return FALSE;
+
+  x = (gint) (OSNX_DRAWER_WIDTH * osnx_ease_out_cubic (animation->progress));
+  cairo_save (cr);
+  cairo_set_source_surface (cr, animation->surface, x, 0);
+  cairo_paint_with_alpha (cr, 1.0 - (0.42 * osnx_ease_out_cubic (animation->progress)));
+  cairo_restore (cr);
+
+  return FALSE;
+}
+
+static cairo_surface_t *
+osnx_snapshot_widget (GtkWidget *widget,
+                      gint      *width,
+                      gint      *height)
+{
+  GtkAllocation allocation;
+  cairo_surface_t *surface;
+  cairo_t *cr;
+
+  gtk_widget_get_allocation (widget, &allocation);
+  *width = MAX (1, allocation.width);
+  *height = MAX (1, allocation.height);
+
+  surface = cairo_image_surface_create (CAIRO_FORMAT_ARGB32, *width, *height);
+  cr = cairo_create (surface);
+  gtk_widget_draw (widget, cr);
+  cairo_destroy (cr);
+
+  return surface;
+}
+
+static gboolean
+osnx_group_clear_tick (GtkWidget     *widget,
+                       GdkFrameClock *frame_clock,
+                       gpointer       user_data)
+{
+  OsnxClearAnimation *animation = user_data;
+  gint64 elapsed_us;
+
+  if (animation->animation_start_us == 0)
+    animation->animation_start_us = gdk_frame_clock_get_frame_time (frame_clock);
+
+  elapsed_us = gdk_frame_clock_get_frame_time (frame_clock) - animation->animation_start_us;
+  animation->progress = CLAMP (elapsed_us / (OSNX_CLEAR_ANIMATION_MS * 1000.0), 0.0, 1.0);
+  gtk_widget_queue_draw (widget);
+
+  if (animation->progress < 1.0)
+    return G_SOURCE_CONTINUE;
+
+  if (animation->drawer->clear_animation_count > 0)
+    animation->drawer->clear_animation_count--;
+
+  g_signal_handlers_disconnect_by_func (widget, G_CALLBACK (osnx_clear_snapshot_draw), animation);
+  gtk_widget_hide (widget);
+
+  if (animation->drawer->clear_group_callback != NULL)
+    animation->drawer->clear_group_callback (animation->group_key, animation->drawer->user_data);
+
+  return G_SOURCE_REMOVE;
+}
+
+static void
 osnx_drawer_position_for_anchor (OsnxDrawer *drawer,
                                  GtkWidget  *anchor)
 {
@@ -115,8 +211,8 @@ osnx_drawer_position_for_anchor (OsnxDrawer *drawer,
   else
     drawer->geometry = (GdkRectangle) { 0, 0, OSNX_DRAWER_WIDTH, 600 };
 
-  gtk_window_resize (GTK_WINDOW (drawer->window), OSNX_WINDOW_WIDTH, drawer->geometry.height);
-  gtk_widget_set_size_request (drawer->shell, OSNX_WINDOW_WIDTH, drawer->geometry.height);
+  gtk_window_resize (GTK_WINDOW (drawer->window), OSNX_DRAWER_WIDTH, drawer->geometry.height);
+  gtk_widget_set_size_request (drawer->shell, OSNX_DRAWER_WIDTH, drawer->geometry.height);
   gtk_widget_set_size_request (drawer->edge_shadow, OSNX_SHADOW_WIDTH, drawer->geometry.height);
   gtk_widget_set_size_request (drawer->panel, OSNX_DRAWER_WIDTH, drawer->geometry.height);
 }
@@ -221,9 +317,76 @@ osnx_group_clear_clicked (GtkButton *button,
 {
   OsnxDrawer *drawer = user_data;
   const gchar *key = g_object_get_data (G_OBJECT (button), "osnx-group-key");
+  GtkWidget *group_widget = g_object_get_data (G_OBJECT (button), "osnx-group-widget");
+  GtkWidget *stage_widget = g_object_get_data (G_OBJECT (button), "osnx-group-stage");
+  OsnxClearAnimation *animation;
+  gint width;
+  gint height;
 
   if (key != NULL && drawer->clear_group_callback != NULL)
-    drawer->clear_group_callback (key, drawer->user_data);
+    {
+      if (stage_widget != NULL && g_object_get_data (G_OBJECT (stage_widget), "osnx-clearing") != NULL)
+        return;
+
+      animation = g_new0 (OsnxClearAnimation, 1);
+      animation->drawer = drawer;
+      animation->group_key = g_strdup (key);
+      animation->stage = stage_widget;
+
+      if (stage_widget != NULL && group_widget != NULL)
+        {
+          animation->surface = osnx_snapshot_widget (group_widget, &width, &height);
+          animation->drawing_area = gtk_drawing_area_new ();
+          gtk_widget_set_size_request (stage_widget, OSNX_DRAWER_WIDTH, height);
+          gtk_widget_set_size_request (animation->drawing_area, OSNX_DRAWER_WIDTH, height);
+          gtk_fixed_put (GTK_FIXED (stage_widget), animation->drawing_area, 0, 0);
+          g_signal_connect (animation->drawing_area, "draw", G_CALLBACK (osnx_clear_snapshot_draw), animation);
+
+          drawer->clear_animation_count++;
+          gtk_widget_set_sensitive (GTK_WIDGET (button), FALSE);
+          gtk_widget_hide (group_widget);
+          g_object_set_data (G_OBJECT (stage_widget), "osnx-clearing", GINT_TO_POINTER (1));
+          gtk_widget_show (animation->drawing_area);
+          gtk_widget_add_tick_callback (animation->drawing_area,
+                                        osnx_group_clear_tick,
+                                        animation,
+                                        (GDestroyNotify) osnx_clear_animation_free);
+        }
+      else
+        {
+          drawer->clear_group_callback (key, drawer->user_data);
+          osnx_clear_animation_free (animation);
+        }
+    }
+}
+
+static void
+osnx_notification_set_active (GtkWidget *widget,
+                              gboolean   active)
+{
+  GtkWidget *row = g_object_get_data (G_OBJECT (widget), "osnx-row-widget");
+  GtkStyleContext *context;
+
+  if (row == NULL)
+    return;
+
+  context = gtk_widget_get_style_context (row);
+  if (active)
+    gtk_style_context_add_class (context, "osnx-row-active");
+  else
+    gtk_style_context_remove_class (context, "osnx-row-active");
+}
+
+static gboolean
+osnx_notification_button_press (GtkWidget      *widget,
+                                GdkEventButton *event,
+                                gpointer        user_data G_GNUC_UNUSED)
+{
+  if (event->button != GDK_BUTTON_PRIMARY)
+    return GDK_EVENT_PROPAGATE;
+
+  osnx_notification_set_active (widget, TRUE);
+  return GDK_EVENT_PROPAGATE;
 }
 
 static gboolean
@@ -237,10 +400,21 @@ osnx_notification_button_release (GtkWidget      *widget,
   if (event->button != GDK_BUTTON_PRIMARY)
     return GDK_EVENT_PROPAGATE;
 
+  osnx_notification_set_active (widget, TRUE);
+
   if (entry_id != NULL && drawer->activate_entry_callback != NULL)
     drawer->activate_entry_callback (entry_id, drawer->user_data);
 
   return GDK_EVENT_STOP;
+}
+
+static gboolean
+osnx_notification_leave (GtkWidget        *widget,
+                         GdkEventCrossing *event G_GNUC_UNUSED,
+                         gpointer          user_data G_GNUC_UNUSED)
+{
+  osnx_notification_set_active (widget, FALSE);
+  return GDK_EVENT_PROPAGATE;
 }
 
 static GPtrArray *
@@ -282,7 +456,9 @@ osnx_build_groups (GPtrArray *entries)
 
 static GtkWidget *
 osnx_create_group_header (OsnxDrawer *drawer,
-                          OsnxGroup  *group)
+                          OsnxGroup  *group,
+                          GtkWidget  *stage_widget,
+                          GtkWidget  *group_widget)
 {
   GtkWidget *header = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 7);
   GtkWidget *image = gtk_image_new_from_gicon (group->icon, GTK_ICON_SIZE_MENU);
@@ -295,8 +471,11 @@ osnx_create_group_header (OsnxDrawer *drawer,
   context = gtk_widget_get_style_context (clear);
   gtk_style_context_add_class (context, "osnx-clear-button");
   gtk_button_set_relief (GTK_BUTTON (clear), GTK_RELIEF_NONE);
-  gtk_widget_set_tooltip_text (clear, "Clear this application's notifications");
+  gtk_widget_set_can_focus (clear, FALSE);
+  gtk_widget_set_focus_on_click (clear, FALSE);
   g_object_set_data_full (G_OBJECT (clear), "osnx-group-key", g_strdup (group->key), g_free);
+  g_object_set_data (G_OBJECT (clear), "osnx-group-stage", stage_widget);
+  g_object_set_data (G_OBJECT (clear), "osnx-group-widget", group_widget);
   g_signal_connect (clear, "clicked", G_CALLBACK (osnx_group_clear_clicked), drawer);
 
   gtk_box_pack_start (GTK_BOX (header), image, FALSE, FALSE, 0);
@@ -341,11 +520,14 @@ osnx_create_notification_row (OsnxDrawer          *drawer,
   gtk_box_pack_start (GTK_BOX (row), main_box, TRUE, TRUE, 0);
 
   gtk_event_box_set_visible_window (GTK_EVENT_BOX (event_box), FALSE);
-  gtk_widget_add_events (event_box, GDK_BUTTON_RELEASE_MASK);
+  gtk_widget_add_events (event_box, GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK | GDK_LEAVE_NOTIFY_MASK);
   gtk_container_add (GTK_CONTAINER (event_box), row);
   if (entry->id != NULL)
     g_object_set_data_full (G_OBJECT (event_box), "osnx-entry-id", g_strdup (entry->id), g_free);
+  g_object_set_data (G_OBJECT (event_box), "osnx-row-widget", row);
+  g_signal_connect (event_box, "button-press-event", G_CALLBACK (osnx_notification_button_press), drawer);
   g_signal_connect (event_box, "button-release-event", G_CALLBACK (osnx_notification_button_release), drawer);
+  g_signal_connect (event_box, "leave-notify-event", G_CALLBACK (osnx_notification_leave), drawer);
 
   return event_box;
 }
@@ -380,15 +562,24 @@ osnx_drawer_render (OsnxDrawer *drawer,
   for (i = 0; i < groups->len; i++)
     {
       OsnxGroup *group = g_ptr_array_index (groups, i);
+      GtkWidget *stage = gtk_fixed_new ();
+      GtkWidget *group_box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
       guint j;
 
-      gtk_box_pack_start (GTK_BOX (drawer->content_box), osnx_create_group_header (drawer, group), FALSE, FALSE, 0);
+      gtk_widget_set_size_request (stage, OSNX_DRAWER_WIDTH, -1);
+      gtk_widget_set_size_request (group_box, OSNX_DRAWER_WIDTH, -1);
+      gtk_style_context_add_class (gtk_widget_get_style_context (stage), "osnx-group-stage");
+      gtk_style_context_add_class (gtk_widget_get_style_context (group_box), "osnx-group");
+      gtk_fixed_put (GTK_FIXED (stage), group_box, 0, 0);
+      gtk_box_pack_start (GTK_BOX (group_box), osnx_create_group_header (drawer, group, stage, group_box), FALSE, FALSE, 0);
 
       for (j = 0; j < group->entries->len; j++)
         {
           const OsnxLogEntry *entry = g_ptr_array_index (group->entries, j);
-          gtk_box_pack_start (GTK_BOX (drawer->content_box), osnx_create_notification_row (drawer, entry), FALSE, FALSE, 0);
+          gtk_box_pack_start (GTK_BOX (group_box), osnx_create_notification_row (drawer, entry), FALSE, FALSE, 0);
         }
+
+      gtk_box_pack_start (GTK_BOX (drawer->content_box), stage, FALSE, FALSE, 0);
     }
 
   gtk_widget_show_all (drawer->content_box);
@@ -402,7 +593,7 @@ osnx_drawer_new (OsnxDrawerClosedFunc        closed_callback,
                  gpointer                    user_data)
 {
   OsnxDrawer *drawer = g_new0 (OsnxDrawer, 1);
-  GtkWidget *shell = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
+  GtkWidget *shell = gtk_overlay_new ();
   GtkWidget *edge_shadow = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
   GtkWidget *outer = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
   GtkWidget *topbar = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 10);
@@ -457,10 +648,16 @@ osnx_drawer_new (OsnxDrawerClosedFunc        closed_callback,
   gtk_scrolled_window_set_shadow_type (GTK_SCROLLED_WINDOW (scrolled), GTK_SHADOW_NONE);
   gtk_container_add (GTK_CONTAINER (scrolled), drawer->content_box);
 
+  gtk_widget_set_halign (edge_shadow, GTK_ALIGN_START);
+  gtk_widget_set_valign (edge_shadow, GTK_ALIGN_FILL);
+  gtk_widget_set_hexpand (edge_shadow, FALSE);
+  gtk_widget_set_vexpand (edge_shadow, TRUE);
+
   gtk_box_pack_start (GTK_BOX (outer), topbar, FALSE, FALSE, 0);
   gtk_box_pack_start (GTK_BOX (outer), scrolled, TRUE, TRUE, 0);
-  gtk_box_pack_start (GTK_BOX (shell), edge_shadow, FALSE, FALSE, 0);
-  gtk_box_pack_start (GTK_BOX (shell), outer, FALSE, FALSE, 0);
+  gtk_container_add (GTK_CONTAINER (shell), outer);
+  gtk_overlay_add_overlay (GTK_OVERLAY (shell), edge_shadow);
+  gtk_overlay_set_overlay_pass_through (GTK_OVERLAY (shell), edge_shadow, TRUE);
   gtk_container_add (GTK_CONTAINER (drawer->window), shell);
 
   return drawer;
@@ -498,9 +695,10 @@ osnx_drawer_show (OsnxDrawer *drawer,
   osnx_drawer_render (drawer, entries, log_available);
 
   hidden_x = drawer->geometry.x + drawer->geometry.width;
-  shown_x = drawer->geometry.x + drawer->geometry.width - OSNX_WINDOW_WIDTH;
+  shown_x = drawer->geometry.x + drawer->geometry.width - OSNX_DRAWER_WIDTH;
   drawer->visible = TRUE;
   drawer->hiding = FALSE;
+  drawer->clear_animation_count = 0;
   gtk_window_move (GTK_WINDOW (drawer->window), hidden_x, drawer->geometry.y);
   gtk_widget_show_all (drawer->window);
   gtk_window_present (GTK_WINDOW (drawer->window));
@@ -529,6 +727,10 @@ osnx_drawer_update (OsnxDrawer *drawer,
     return;
 
   osnx_drawer_sync_alerts (drawer, alerts_enabled);
+
+  if (drawer->clear_animation_count > 0)
+    return;
+
   osnx_drawer_render (drawer, entries, log_available);
 }
 

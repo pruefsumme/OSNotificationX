@@ -20,7 +20,7 @@ gboolean osnx_log_client_has_unread (OsnxLogClient *client);
 GPtrArray *osnx_log_client_get_entries (OsnxLogClient *client);
 void osnx_log_client_refresh (OsnxLogClient *client);
 void osnx_log_client_mark_visible_read (OsnxLogClient *client);
-void osnx_log_client_delete_group (OsnxLogClient *client, const gchar *group_key);
+void osnx_log_client_hide_group (OsnxLogClient *client, const gchar *group_key);
 gboolean osnx_log_client_activate_entry (OsnxLogClient *client, const gchar *entry_id);
 
 G_END_DECLS

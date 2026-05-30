@@ -10,3 +10,16 @@ test_log_entry = executable(
 )
 
 test('log-entry', test_log_entry)
+
+test_hidden_store = executable(
+  'test-hidden-store',
+  'test-hidden-store.c',
+  include_directories: [
+    osnx_common_inc,
+    include_directories('..'),
+  ],
+  dependencies: osnx_common_deps,
+  link_with: osnx_common_lib,
+)
+
+test('hidden-store', test_hidden_store)

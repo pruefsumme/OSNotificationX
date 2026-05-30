@@ -37,7 +37,7 @@ After installation, add **OSNotificationX** from the XFCE panel's “Add New Ite
 
 The applet reads notifications from `org.xfce.Notifyd.Log` and uses Xfconf’s `xfce4-notifyd:/do-not-disturb` setting for the top alerts switch.
 
-Group clear buttons hide notifications from the open center without deleting rows from XFCE notifyd's log database. Clicking a notification attempts to open its source app through the matching `.desktop` entry; whether an existing window is raised depends on that app and the window manager.
+Group clear buttons hide notifications from the center without deleting rows from XFCE notifyd's log database. Hidden notification IDs are persisted separately in `~/.config/osnotificationx/state.ini`, so they remain hidden after panel reloads and reboots. Clicking a notification attempts to open its source app through the matching `.desktop` entry; whether an existing window is raised depends on that app and the window manager.
 
 ## Notification Test
 
